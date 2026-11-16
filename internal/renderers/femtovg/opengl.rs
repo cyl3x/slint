@@ -63,6 +63,16 @@ pub unsafe trait OpenGLInterface {
     /// Returns the address of the OpenGL function specified by name, or a null pointer if the
     /// function does not exist.
     fn get_proc_address(&self, name: &std::ffi::CStr) -> *const std::ffi::c_void;
+    /// Identifies the group of contexts that share OpenGL objects with this one. Renderers whose
+    /// interfaces return the same id use one set of linked shader programs on the thread, instead
+    /// of linking their own. The default, `None`, links a set per renderer.
+    ///
+    /// Return the same id only for contexts that share objects (a single context that several
+    /// windows render with, or contexts created with sharing), and an id that is not reused while
+    /// any of them exists.
+    fn share_group(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
@@ -124,6 +134,12 @@ impl Drop for SnapshotTargetGuard<'_> {
     }
 }
 
+#[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
+thread_local! {
+    static PROGRAM_CACHES: RefCell<std::collections::HashMap<usize, femtovg::renderer::ProgramCache>> =
+        Default::default();
+}
+
 pub struct OpenGLBackend {
     opengl_context: RefCell<Box<dyn OpenGLInterface>>,
     snapshot_target: RefCell<Option<femtovg::ImageId>>,
@@ -146,9 +162,19 @@ impl OpenGLBackend {
         let opengl_context = Box::new(opengl_context);
         #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
         let gl_renderer = unsafe {
-            femtovg::renderer::OpenGl::new_from_function_cstr(|name| {
-                opengl_context.get_proc_address(name)
-            })
+            match opengl_context.share_group() {
+                Some(group) => {
+                    let programs = PROGRAM_CACHES
+                        .with(|caches| caches.borrow_mut().entry(group).or_default().clone());
+                    femtovg::renderer::OpenGl::new_from_function_cstr_with_program_cache(
+                        |name| opengl_context.get_proc_address(name),
+                        &programs,
+                    )
+                }
+                None => femtovg::renderer::OpenGl::new_from_function_cstr(|name| {
+                    opengl_context.get_proc_address(name)
+                }),
+            }
             .unwrap()
         };
 
